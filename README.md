@@ -6,7 +6,7 @@ This is an anonymous code repo for [You Only Prefill Once: Fusing Cached Knowled
 To install CacheFuse depenencies
 ```
 git clone git@github.com:CachefuseAuthors/CacheFuse.git
-ca cachefuse
+cd CacheFuse
 pip install -e .
 ```
 

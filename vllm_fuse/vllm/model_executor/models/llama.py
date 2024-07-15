@@ -21,41 +21,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
-import torch.distributed
 from transformers import LlamaConfig
 
+from vllm.attention import Attention, AttentionMetadata
 from vllm.config import LoRAConfig
-from vllm.model_executor.input_metadata import InputMetadata
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding, ParallelLMHead, DEFAULT_VOCAB_PADDING_SIZE)
-from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_world_size)
+    DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader, kv_cache_scales_loader)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.model_executor.weight_utils import (default_weight_loader,
-                                              hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
-
-from torch.profiler import profile, record_function, ProfilerActivity
-import time
-import threading
-import numpy as np
-from multiprocessing import Process
-import queue
-
-KVCache = Tuple[torch.Tensor, torch.Tensor]
+from vllm.utils import is_hip
 
 
 class LlamaMLP(nn.Module):
@@ -125,6 +116,15 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
+        # This will be overwritten by model initialization if we are using it.
+        # N.B. currently we only support per tensor scalar scaling factors
+        # & only applicable to ROCm (AMD GPU).
+        # The scaling factor convention we are assuming is
+        # quantized_value * scaling_factor ~= true_value
+        # which is consistent with the practice of setting
+        # scaling_factor = tensor_amax / FPtype_max
+        self.kv_scale = 1.0
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -152,24 +152,38 @@ class LlamaAttention(nn.Module):
                               self.scaling,
                               num_kv_heads=self.num_kv_heads,
                               sliding_window=sliding_window)
+        
+        self.hack_kv = []
 
     def forward(
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: KVCache,
-        input_metadata: InputMetadata,
-        status: int,
-        cache_fuse_metadata: dict,
-        cache_load_metadata: dict
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
+        
+        status,
+        cache_fuse_metadata,
+        old_kv,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
+        
+        # HACK(Jiayi): Rotate the old K 
+        # Need to modify the kernel to only take K as input 
+        if status in [1,2]:
+            if cache_fuse_metadata["fake_q"] is None:
+                cache_fuse_metadata['fake_q'] = torch.rand_like(q)
+            _, old_kv[0] = self.rotary_emb(cache_fuse_metadata['org_pos'],
+                                        cache_fuse_metadata['fake_q'],
+                                        old_kv[0])
+            
+        if cache_fuse_metadata['collect']:
+            self.hack_kv = [k.clone(), v.clone()]
         q, k = self.rotary_emb(positions, q, k)
-        k_cache, v_cache = kv_cache
-        attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata, 
-                                status, cache_fuse_metadata, cache_load_metadata)
+        attn_output = self.attn(q, k, v, kv_cache, attn_metadata,
+                                status, cache_fuse_metadata, old_kv,
+                                self.kv_scale)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -188,6 +202,10 @@ class LlamaDecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
         sliding_window = getattr(config, "sliding_window", None)
+        # Support abacusai/Smaug-72B-v0.1 with attention_bias
+        # Support internlm/internlm-7b with bias
+        attention_bias = getattr(config, "attention_bias", False) or getattr(
+            config, "bias", False)
         self.self_attn = LlamaAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -197,7 +215,7 @@ class LlamaDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             linear_method=linear_method,
-            bias=getattr(config, "bias", False),
+            bias=attention_bias,
             sliding_window=sliding_window,
         )
         self.mlp = LlamaMLP(
@@ -215,25 +233,15 @@ class LlamaDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: KVCache,
-        input_metadata: InputMetadata,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
+        
         status: int,
         cache_fuse_metadata: dict,
-        cache_load_metadata: dict
+        old_kv,
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        
-        #if hidden_states.shape[1]>200:
-        #    torch.cuda.synchronize()
-        #    start = torch.cuda.Event(enable_timing=True)
-        #    end = torch.cuda.Event(enable_timing=True)
-        #    start.record()
-        #if hidden_states.shape[1]>20:
-        #    torch.cuda.synchronize()
-        #    start = torch.cuda.Event(enable_timing=True)
-        #    end = torch.cuda.Event(enable_timing=True)
-        #    start.record()
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -244,59 +252,23 @@ class LlamaDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
-            input_metadata=input_metadata,
+            attn_metadata=attn_metadata,
+            
+            # Jiayi: modified start
             status=status,
             cache_fuse_metadata=cache_fuse_metadata,
-            cache_load_metadata = cache_load_metadata
+            old_kv=old_kv,
+            # Jiayi: modified end
         )
+
+        if status == 1:
+            residual = residual[cache_fuse_metadata["imp_indices"]]
         
-        if status==1:
-            residual = residual[:, cache_fuse_metadata["imp_token_indices"]]
-        #if hidden_states.shape[1]>20:
-        #    end.record()
-        #    torch.cuda.synchronize()
-        #    temp_time = start.elapsed_time(end)
-        #    print(f"Attention time:{temp_time}")
-            
-        #if hidden_states.shape[1]>20:
-        #    torch.cuda.synchronize()
-        #    start = torch.cuda.Event(enable_timing=True)
-        #    end = torch.cuda.Event(enable_timing=True)
-        #    start.record()
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        #if hidden_states.shape[1]>20:
-        #    end.record()
-        #    torch.cuda.synchronize()
-        #    temp_time = start.elapsed_time(end)
-        #    print(f"MLP time:{temp_time}")
         return hidden_states, residual
-
-@torch.inference_mode
-def load_worker(queue):
-    #load_stream = torch.cuda.Stream()
-    
-    
-    while True:
-        item = queue.get()
-        if item is None:
-            queue.task_done()
-            return
-        cpu_k, cpu_v, gpu_k, gpu_v, load_stream,event = item
-        with torch.cuda.stream(load_stream):
-            disk_k = torch.load("/local/jiayi3/temp_k_test_0.pt")
-            #disk_v = torch.load("/local/jiayi3/temp_v.pt")
-            cpu_k.copy_(disk_k)
-            #cpu_v.copy_(disk_v, non_blocking=True)
-            gpu_k.copy_(cpu_k, non_blocking=True)
-            #gpu_v.copy_(cpu_v, non_blocking=True)
-        event.set()
-        
-        
-        queue.task_done()
-    
 
 
 class LlamaModel(nn.Module):
@@ -324,291 +296,86 @@ class LlamaModel(nn.Module):
             for _ in range(config.num_hidden_layers)
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
-        
-        # FIXME(Jiayi): needs to be dynamic
-        # FIXME(Jiayi): currently only support `batch_size=1`
-        # batching for prefill (e.g., (prompt_with_reuse, prompt_with_no_reuse)) will
-        # dillute our improvement sometimes 
+
         self.cache_fuse_metadata = {"check_layers":[1],
-                                    "check": True,
-                                    "recomp_ratios":[0.77],
-                                    "recomp_ratio":0.77,
-                                    "load_indices":[],
-                                    "recomp_indices":[],
+                                    "check": False,
+                                    "recomp_ratios":[0.16],
+                                    "recomp_ratio":0.16,
                                     "original_slot_mapping":None,
-                                    "our_slot_mapping_for_check":None,
                                     "our_slot_mapping":None,
                                     "kv_cache_dtype": None,
                                     "attn_bias": None,
-                                    "imp_token_indices": None,
+                                    "imp_indices": None,
                                     "org_seq_len": None,
-                                    "pre_mask":None}
-                                    #"batch_indices":[0]}
-        #self.cache_load_metadata = { "loader" :  None,
-        #                            "hash": "kv_temp"}
-        self.loader = None
+                                    "collect": False}
         
-        #self.load_stream_test = torch.cuda.Stream()
-        self.load_streams = [torch.cuda.Stream() for i in range(len(self.layers)-1)]
-        self.load_events = [threading.Event() for i in range(len(self.layers)-1)]
-        num_thread = 1
-        self.load_queue = queue.Queue()
-        self.load_threads = [
-            threading.Thread(
-                target=load_worker, args=(self.load_queue,)
-            ) for i in range(num_thread)
-        ]
-        for t in self.load_threads:
-            t.start()
-        test_shape = (4002,8,128)
-        self.key_buf_pin = torch.rand(test_shape, dtype=torch.float16).cpu().pin_memory()
-        self.value_buf_pin = torch.rand(test_shape, dtype=torch.float16).cpu().pin_memory()
-        self.key_buf = torch.rand(test_shape, dtype=torch.float16).cuda()
-        self.value_buf = torch.rand(test_shape, dtype=torch.float16).cuda()
+        self.old_kvs = [[None,None]] * len(self.layers)
         
-    def submit_load(self, *args):
-        self.load_queue.put_nowait(args)
-    
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
-        kv_caches: List[KVCache],
-        input_metadata: InputMetadata,
-        cache_fuse_metadata=None,
-        sampling_metadata=None
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        #Jiayi: input_ids shape: [bsz, input_len]
-        #print(f"\033[33mHere, the input ids shape is {input_ids.shape}\033[0m")
-        hidden_states = self.embed_tokens(input_ids)
-        #Jiayi: hidden_states shape: [bsz, input_len, hidden_dim]
-        #print(f"\033[32mHere, the hidden states shape is {hidden_states.shape}\033[0m")
-        #if kv_caches[0][0] is not None:
-        #    print(f"\033[32mHere, the KV cache shape {kv_caches[0][0].shape}\033[0m")
-        #else:
-        #    print("\033[31mThis time we don't have any KV caches\033[0m")
-        residual = None
-        
-        #FIXME(Jiayi): This is a hack to make it run
-        #if cache_fuse_metadata==None:
-        #    cache_fuse_metadata=self.cache_fuse_metadata
-        
-        flag=None
-        
-        #HACK(Jiayi): This is a hack to measure accurate time
-        if input_ids.shape[1]>1000 and input_ids.shape[0]==1 and input_metadata.is_prompt:
-                      
-            flag=True
-            self.cache_fuse_metadata = {"check_layers":[1],
-                                    "check": True,
-                                    "recomp_ratios":[0.17],
-                                    "recomp_ratio":0.17,
-                                    "load_indices":[],
-                                    "recomp_indices":[],
-                                    "original_slot_mapping":None,
-                                    "our_slot_mapping_for_check":None,
-                                    "our_slot_mapping":None,
-                                    "kv_cache_dtype": None,
-                                    "attn_bias": None,
-                                    "imp_token_indices": None,
-                                    "org_seq_len": None,
-                                    "pre_mask":None,
-                                    "key_value_shape":(hidden_states.shape[1], 8, 128), #Note this is for mis7b; 70B?
-                                    "stream_activate":True}
-
-            input_metadata.attn_bias = None #Jiayi: delete attn_bias from last inference and 
-            torch.cuda.synchronize()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
         else:
-            self.cache_fuse_metadata = {"check_layers":[1],
-                                    "check": False,
-                                    "recomp_ratios":[0.15],
-                                    "recomp_ratio":0.15,
-                                    "load_indices":[],
-                                    "recomp_indices":[],
-                                    "original_slot_mapping":None,
-                                    "our_slot_mapping_for_check":None,
-                                    "our_slot_mapping":None,
-                                    "kv_cache_dtype": None,
-                                    "attn_bias": None,
-                                    "imp_token_indices": None,
-                                    "org_seq_len": None,
-                                    "pre_mask":None,
-                                    "key_value_shape":None,
-                                    "stream_activate":False}
-            
+            hidden_states = self.get_input_embeddings(input_ids)
         
-        #import pdb
-        #pdb.set_trace()
-        
-        if input_metadata.is_prompt:
-            #import pdb
-            #pdb.set_trace()
-            temp_status = 0 # full recomp
-            self.cache_fuse_metadata["org_seq_len"] = input_ids.shape[1]
-            
-            #FIXME(Jiayi): fix this clone for faster time
-            self.cache_fuse_metadata["our_slot_mapping"] = input_metadata.slot_mapping.clone()
+        if attn_metadata.prefill_metadata:
+            temp_status = 0 # full prefill
+            if self.cache_fuse_metadata["check"]:
+                self.cache_fuse_metadata["org_seq_len"] = input_ids.shape[0] 
+                check_layer_idx = 0
+                self.cache_fuse_metadata["fake_q"] = None  
+                self.cache_fuse_metadata["attn_bias"] = None
+                self.cache_fuse_metadata["imp_indices"] = None
+                self.cache_fuse_metadata["original_slot_mapping"] = None
+                self.cache_fuse_metadata["our_slot_mapping"] = None
+                self.cache_fuse_metadata['org_pos'] = positions[:]
+            #FIXME(Jiayi): fix this clone for faster time (Is this still needed?)
+            #self.cache_fuse_metadata["our_slot_mapping"] = input_metadata.slot_mapping.clone()
         else:
             temp_status = -1 # decode
-        '''
-        if flag and self.cache_fuse_metadata["stream_activate"]:
-            key_fake = torch.rand(self.cache_fuse_metadata["key_value_shape"], dtype=hidden_states.dtype).cpu()
-            value_fake = torch.rand(self.cache_fuse_metadata["key_value_shape"], dtype=hidden_states.dtype).cpu()
-            key_buf_pin = torch.rand(self.cache_fuse_metadata["key_value_shape"], dtype=hidden_states.dtype).pin_memory()
-            value_buf_pin = torch.rand(self.cache_fuse_metadata["key_value_shape"], dtype=hidden_states.dtype).pin_memory()
-            key_buf = torch.rand(self.cache_fuse_metadata["key_value_shape"], dtype=hidden_states.dtype).to(hidden_states.device)
-            value_buf = torch.rand(self.cache_fuse_metadata["key_value_shape"], dtype=hidden_states.dtype).to(hidden_states.device)
-            path_k = "/local/jiayi3/temp_k.pt"
-            path_v = "/local/jiayi3/temp_v.pt"
-            torch.save(key_fake, path_k)
-            torch.save(value_fake, path_v)
-            b,s,h = self.cache_fuse_metadata["key_value_shape"]
-            indices = (slice(0, b), slice(0, s), slice(0, h))
-            #np.lib.format.open_memmap(path_k, mode="w+", shape=((b,s,h)), dtype=np.float16)
-            disk_k = path_k
-            #np.lib.format.open_memmap(path_v, mode="w+", shape=((b,s,h)), dtype=np.float16)
-            disk_v = path_v
-            #disk_k_tensor = torch.from_numpy(np.lib.format.open_memmap(disk_k))
-            #disk_v_tensor = torch.from_numpy(np.lib.format.open_memmap(disk_v))
-            #disk_k_tensor.copy_(key_fake)
-            #disk_v_tensor.copy_(value_fake)
+        residual = None
+        
+        
+        for i in range(len(self.layers)):
             
-            disk_k_tensor = disk_k
-            disk_v_tensor = disk_v
-        '''
+            if self.cache_fuse_metadata["check"]:
+                if i in self.cache_fuse_metadata["check_layers"]:
+                    temp_status = 1 # check this layer
+                    self.cache_fuse_metadata["check_layer"] = self.cache_fuse_metadata["check_layers"][check_layer_idx]
+                    check_layer_idx += 1
+                elif i > self.cache_fuse_metadata["check_layers"][0]:
+                    temp_status = 2 # after check
             
-        if self.cache_fuse_metadata["stream_activate"]:
-            for i in range(len(self.layers)-1):
-                self.submit_load(self.key_buf_pin,self.value_buf_pin,self.key_buf,self.value_buf,self.load_streams[i], self.load_events[i])
-
-        check_layer_idx = 0
-        if flag:
-            #time.sleep(1)
-            #torch.cuda.synchronize()
-            #with profile(activities=[ProfilerActivity.CPU, ProfilerActivity.CUDA]) as prof:
-            for i in range(len(self.layers)):
-                if self.cache_fuse_metadata["check"]:
-                    if i in self.cache_fuse_metadata["check_layers"]:
-                        temp_status = 1 # check this layer
-                        self.cache_fuse_metadata["check_layer"] = self.cache_fuse_metadata["check_layers"][check_layer_idx]
-                        check_layer_idx += 1
-                    elif i > self.cache_fuse_metadata["check_layers"][0]:
-                        temp_status = 2 # after check
+            old_kv = self.old_kvs[i]
+            
+            layer = self.layers[i]
+            hidden_states, residual = layer(
+                positions,
+                hidden_states,
+                kv_caches[i],
+                attn_metadata,
+                residual,
                 
-                #if cache_fuse_metadata["check"]:
-                #    import pdb
-                #    pdb.set_trace()
-                
-                #if i == 1 get prefetch result. plan for actual loading.
-                #Load kv into temprary tensors for Jiayi to use
-
-                layer = self.layers[i]
-                
-                #FIXME(Jiayi): add double buffer to overcome data races
-                #FIXME(Jiayi): use both cuda streams and multiprocessing to do pipeining (multithreading cause issues in ray)
-                #FIXME(Jiayi): fetch_ky_layer should also include dtype? (type conversion should be postoned for efficiency)
-                #if self.cache_fuse_metadata["stream_activate"] and i < len(self.layers)-1:
-                #    self.submit_load(self.key_buf_pin,self.value_buf_pin,self.key_buf,self.value_buf,self.load_streams[i])
-                        #key_buf.copy_(key_buf_pin, non_blocking=True)
-                        #value_buf.copy_(value_buf_pin, non_blocking=True)
-                        #key_buffed = self.cache_load_metadata['loader'].fetch_kv_layer(hash=self.cache_load_metadata['key_hash'],
-                        #                                                            layer_idx=i+1,
-                        #                                                            device=hidden_states.device)
-                        #value_buffed = self.cache_load_metadata['loader'].fetch_kv_layer(hash=self.cache_load_metadata['key_hash'],
-                        #                                                                layer_idx=i+1,
-                        #                                                                device=hidden_states.device)
-                
-                #if input_ids.shape[1]>3800 and input_metadata.is_prompt:
-                #    torch.cuda.synchronize()
-                #    start = torch.cuda.Event(enable_timing=True)
-                #    end = torch.cuda.Event(enable_timing=True)
-                #    start.record()
-                hidden_states, residual = layer(
-                    positions, #FIXME(Jiayi): positions need to be changed
-                    hidden_states,
-                    kv_caches[i],
-                    input_metadata,
-                    residual,
-                    status = temp_status,
-                    cache_fuse_metadata = self.cache_fuse_metadata,
-                    cache_load_metadata = None,
-                    #cache_load_metadata = self.cache_load_metadata
-                )
-                #if input_ids.shape[1]>3800 and input_metadata.is_prompt:
-                #    end.record()
-                #    torch.cuda.synchronize()
-                #    temp_time = start.elapsed_time(end)
-                #    print(f"Layer{i}: {temp_time}")
-
-                if temp_status==1:
-                    positions = positions[:,self.cache_fuse_metadata["imp_token_indices"]]
-                
-                #Jiayi: sunchronize loading and recomputation
-                if self.cache_fuse_metadata["stream_activate"] and i < len(self.layers)-1:
-                    #print(f"Before: {self.load_queue.qsize()}")
-                    print(self.load_events[i].is_set())
-                    while (not self.load_events[i].is_set()):
-                        time.sleep(0.001)
-                        pass
-                    #self.load_queue.join()
-                    torch.cuda.current_stream().wait_stream(self.load_streams[i])
-                    print(self.load_events[i].is_set())
-                    print(f"After: {self.load_queue.qsize()}")
-                    #torch.cuda.synchronize()
-                    #time.sleep(0.05)
-                    
-                #    key_temp.copy_(key_buffed)
-                #    value_temp.copy_(value_buffed)
-            hidden_states, _ = self.norm(hidden_states, residual)
-            #if self.cache_fuse_metadata["stream_activate"]:
-            #    self.load_queue.join()
-            if flag:
-                for i in range(31):
-                    self.load_events[i].clear()
-                end.record()
-                torch.cuda.synchronize()
-                temp_time = start.elapsed_time(end)
-                print(temp_time)
-                #print(cache_fuse_metadata)
+                status = temp_status,
+                cache_fuse_metadata=self.cache_fuse_metadata,
+                old_kv=old_kv
+            )
+            
+            if temp_status==1:
                 #import pdb
                 #pdb.set_trace()
-                #sampling_metadata.selected_token_indices[0]= len(self.cache_fuse_metadata["imp_token_indices"])-1
-                #sampling_metadata.prompt_lens[0] = len(self.cache_fuse_metadata["imp_token_indices"])
-            #prof.export_chrome_trace("/dataheart/jiayi3/profile/trace.json")
-        else:
-            for i in range(len(self.layers)):
-                if self.cache_fuse_metadata["check"]:
-                    if i in self.cache_fuse_metadata["check_layers"]:
-                        temp_status = 1 # check this layer
-                        self.cache_fuse_metadata["check_layer"] = self.cache_fuse_metadata["check_layers"][check_layer_idx]
-                        check_layer_idx += 1
-                    elif i > self.cache_fuse_metadata["check_layers"][0]:
-                        temp_status = 2 # after check
-                
-
-                layer = self.layers[i]
-                
-                hidden_states, residual = layer(
-                    positions, #FIXME(Jiayi): positions need to be changed
-                    hidden_states,
-                    kv_caches[i],
-                    input_metadata,
-                    residual,
-                    status = temp_status,
-                    cache_fuse_metadata = self.cache_fuse_metadata,
-                    cache_load_metadata = None,
-                    #cache_load_metadata = self.cache_load_metadata
-                )
-
-                if temp_status==1:
-                    positions = positions[:,self.cache_fuse_metadata["imp_token_indices"]]
-                
-            hidden_states, _ = self.norm(hidden_states, residual)
-            
-        return hidden_states, sampling_metadata
+                positions = positions[self.cache_fuse_metadata["imp_indices"]]
+        hidden_states, _ = self.norm(hidden_states, residual)
+        return hidden_states
 
 
 class LlamaForCausalLM(nn.Module):
@@ -661,38 +428,38 @@ class LlamaForCausalLM(nn.Module):
             # compatibility
             if not lora_config else lora_config.lora_vocab_padding_size,
         )
-        self.sampler = Sampler(self.unpadded_vocab_size, config.vocab_size)
+
+        logit_scale = getattr(config, "logit_scale", 1.0)
+        self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
+                                                config.vocab_size, logit_scale)
+        self.sampler = Sampler()
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[KVCache],
-        input_metadata: InputMetadata,
-        cache_fuse_metadata=None,
-        sampling_metadata=None
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
-        hidden_states, sampling_metadata = self.model(input_ids, positions, kv_caches,
-                                   input_metadata, 
-                                   cache_fuse_metadata, 
-                                   sampling_metadata)
-        return hidden_states, sampling_metadata
+        hidden_states = self.model(input_ids, positions, kv_caches,
+                                   attn_metadata)
+        return hidden_states
 
-    #HACK(Jiayi): sampler hacked
+    def compute_logits(self, hidden_states: torch.Tensor,
+                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
+        logits = self.logits_processor(self.lm_head.weight, hidden_states,
+                                       sampling_metadata)
+        return logits
+
     def sample(
         self,
-        hidden_states: torch.Tensor,
+        logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(self.lm_head.weight, hidden_states,
-                                   sampling_metadata)
+        next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
-    def load_weights(self,
-                     model_name_or_path: str,
-                     cache_dir: Optional[str] = None,
-                     load_format: str = "auto",
-                     revision: Optional[str] = None):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -702,8 +469,7 @@ class LlamaForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in hf_model_weights_iterator(
-                model_name_or_path, cache_dir, load_format, revision):
+        for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             if ("rotary_emb.cos_cached" in name
@@ -730,3 +496,27 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    # If this function is called, it should always initialize KV cache scale
+    # factors (or else raise an exception). Thus, handled exceptions should
+    # make sure to leave KV cache scale factors in a known good (dummy) state
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        for layer_idx, scaling_factor in kv_cache_scales_loader(
+                quantization_param_path, tp_rank, tp_size,
+                self.config.num_hidden_layers,
+                self.config.__class__.model_type):
+            layer_self_attn = self.model.layers[layer_idx].self_attn
+
+            if is_hip():
+                # The scaling factor convention we are assuming is
+                # quantized_value * scaling_factor ~= true_value
+                # which is consistent with the practice of setting
+                # scaling_factor = tensor_amax / FPtype_max
+                scaling_factor *= 2
+            if hasattr(layer_self_attn, "kv_scale"):
+                layer_self_attn.kv_scale = scaling_factor
+            else:
+                raise RuntimeError("Self attention has no KV cache scaling "
+                                   "factor attribute!")

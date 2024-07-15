@@ -21,33 +21,32 @@
 # See the License for the specific language governing permissions and
 # limitations under the License.
 """Inference-only LLaMA model compatible with HuggingFace weights."""
-from typing import Any, Dict, List, Optional, Tuple
+from typing import Any, Dict, Iterable, List, Optional, Tuple
 
 import torch
 from torch import nn
 from transformers import LlamaConfig
 
+from vllm.attention import Attention, AttentionMetadata
 from vllm.config import LoRAConfig
-from vllm.model_executor.input_metadata import InputMetadata
+from vllm.distributed import (get_tensor_model_parallel_rank,
+                              get_tensor_model_parallel_world_size)
 from vllm.model_executor.layers.activation import SiluAndMul
-from vllm.model_executor.layers.attention import Attention
 from vllm.model_executor.layers.layernorm import RMSNorm
 from vllm.model_executor.layers.linear import (LinearMethodBase,
                                                MergedColumnParallelLinear,
                                                QKVParallelLinear,
                                                RowParallelLinear)
+from vllm.model_executor.layers.logits_processor import LogitsProcessor
 from vllm.model_executor.layers.rotary_embedding import get_rope
 from vllm.model_executor.layers.sampler import Sampler
 from vllm.model_executor.layers.vocab_parallel_embedding import (
-    VocabParallelEmbedding, ParallelLMHead, DEFAULT_VOCAB_PADDING_SIZE)
-from vllm.model_executor.parallel_utils.parallel_state import (
-    get_tensor_model_parallel_world_size)
+    DEFAULT_VOCAB_PADDING_SIZE, ParallelLMHead, VocabParallelEmbedding)
+from vllm.model_executor.model_loader.weight_utils import (
+    default_weight_loader, kv_cache_scales_loader)
 from vllm.model_executor.sampling_metadata import SamplingMetadata
-from vllm.model_executor.weight_utils import (default_weight_loader,
-                                              hf_model_weights_iterator)
 from vllm.sequence import SamplerOutput
-
-KVCache = Tuple[torch.Tensor, torch.Tensor]
+from vllm.utils import is_hip
 
 
 class LlamaMLP(nn.Module):
@@ -117,6 +116,15 @@ class LlamaAttention(nn.Module):
         self.rope_theta = rope_theta
         self.max_position_embeddings = max_position_embeddings
 
+        # This will be overwritten by model initialization if we are using it.
+        # N.B. currently we only support per tensor scalar scaling factors
+        # & only applicable to ROCm (AMD GPU).
+        # The scaling factor convention we are assuming is
+        # quantized_value * scaling_factor ~= true_value
+        # which is consistent with the practice of setting
+        # scaling_factor = tensor_amax / FPtype_max
+        self.kv_scale = 1.0
+
         self.qkv_proj = QKVParallelLinear(
             hidden_size,
             self.head_dim,
@@ -149,15 +157,14 @@ class LlamaAttention(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: KVCache,
-        input_metadata: InputMetadata,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         qkv, _ = self.qkv_proj(hidden_states)
-        
         q, k, v = qkv.split([self.q_size, self.kv_size, self.kv_size], dim=-1)
         q, k = self.rotary_emb(positions, q, k)
-        k_cache, v_cache = kv_cache
-        attn_output = self.attn(q, k, v, k_cache, v_cache, input_metadata)
+        attn_output = self.attn(q, k, v, kv_cache, attn_metadata,
+                                self.kv_scale)
         output, _ = self.o_proj(attn_output)
         return output
 
@@ -176,6 +183,10 @@ class LlamaDecoderLayer(nn.Module):
         max_position_embeddings = getattr(config, "max_position_embeddings",
                                           8192)
         sliding_window = getattr(config, "sliding_window", None)
+        # Support abacusai/Smaug-72B-v0.1 with attention_bias
+        # Support internlm/internlm-7b with bias
+        attention_bias = getattr(config, "attention_bias", False) or getattr(
+            config, "bias", False)
         self.self_attn = LlamaAttention(
             hidden_size=self.hidden_size,
             num_heads=config.num_attention_heads,
@@ -185,7 +196,7 @@ class LlamaDecoderLayer(nn.Module):
             rope_scaling=rope_scaling,
             max_position_embeddings=max_position_embeddings,
             linear_method=linear_method,
-            bias=getattr(config, "bias", False),
+            bias=attention_bias,
             sliding_window=sliding_window,
         )
         self.mlp = LlamaMLP(
@@ -203,18 +214,11 @@ class LlamaDecoderLayer(nn.Module):
         self,
         positions: torch.Tensor,
         hidden_states: torch.Tensor,
-        kv_cache: KVCache,
-        input_metadata: InputMetadata,
+        kv_cache: torch.Tensor,
+        attn_metadata: AttentionMetadata,
         residual: Optional[torch.Tensor],
     ) -> Tuple[torch.Tensor, torch.Tensor]:
         # Self Attention
-        '''
-        if hidden_states.shape[1] > 500:
-            torch.cuda.synchronize()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-        '''
         if residual is None:
             residual = hidden_states
             hidden_states = self.input_layernorm(hidden_states)
@@ -225,32 +229,13 @@ class LlamaDecoderLayer(nn.Module):
             positions=positions,
             hidden_states=hidden_states,
             kv_cache=kv_cache,
-            input_metadata=input_metadata,
+            attn_metadata=attn_metadata,
         )
-        
-        '''
-        if hidden_states.shape[1] > 500:
-            end.record()
-            torch.cuda.synchronize()
-            temp_time = start.elapsed_time(end)
-            print(f"attn_time: {temp_time}")
-        if hidden_states.shape[1] > 500:
-            torch.cuda.synchronize()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-        '''
+
         # Fully Connected
         hidden_states, residual = self.post_attention_layernorm(
             hidden_states, residual)
         hidden_states = self.mlp(hidden_states)
-        '''
-        if hidden_states.shape[1] > 500:
-            end.record()
-            torch.cuda.synchronize()
-            temp_time = start.elapsed_time(end)
-            print(f"mlp_time: {temp_time}")
-        '''
         return hidden_states, residual
 
 
@@ -280,32 +265,21 @@ class LlamaModel(nn.Module):
         ])
         self.norm = RMSNorm(config.hidden_size, eps=config.rms_norm_eps)
 
+    def get_input_embeddings(self, input_ids: torch.Tensor) -> torch.Tensor:
+        return self.embed_tokens(input_ids)
+
     def forward(
         self,
-        input_ids: torch.Tensor,
+        input_ids: Optional[torch.Tensor],
         positions: torch.Tensor,
-        kv_caches: List[KVCache],
-        input_metadata: InputMetadata,
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
+        inputs_embeds: Optional[torch.Tensor] = None,
     ) -> torch.Tensor:
-        #Jiayi: input_ids shape: [bsz, input_len]
-        print(f"\033[33mHere, the input ids shape is {input_ids.shape}\033[0m")
-        hidden_states = self.embed_tokens(input_ids)
-        #Jiayi: hidden_states shape: [bsz, input_len, hidden_dim]
-        print(f"\033[32mHere, the hidden states shape is {hidden_states.shape}\033[0m")
-        if kv_caches[0][0] is not None:
-            print(f"\033[32mHere, the KV cache shape {kv_caches[0][0].shape}\033[0m")
+        if inputs_embeds is not None:
+            hidden_states = inputs_embeds
         else:
-            print("\033[31mThis time we don't have any KV caches\033[0m")
-        
-        #if input_ids.shape[1] > 1000:
-        #    import pdb
-        #    pdb.set_trace()
-        if input_ids.shape[1] > 500:
-            torch.cuda.synchronize()
-            start = torch.cuda.Event(enable_timing=True)
-            end = torch.cuda.Event(enable_timing=True)
-            start.record()
-        
+            hidden_states = self.get_input_embeddings(input_ids)
         residual = None
         for i in range(len(self.layers)):
             layer = self.layers[i]
@@ -313,21 +287,10 @@ class LlamaModel(nn.Module):
                 positions,
                 hidden_states,
                 kv_caches[i],
-                input_metadata,
+                attn_metadata,
                 residual,
             )
         hidden_states, _ = self.norm(hidden_states, residual)
-        
-        if input_ids.shape[1] > 500:
-            end.record()
-            torch.cuda.synchronize()
-
-            temp_time = start.elapsed_time(end)
-            print(temp_time)
-        #if input_ids.shape[0] == 6:
-        #    import pdb
-        #    pdb.set_trace()
-        
         return hidden_states
 
 
@@ -381,33 +344,38 @@ class LlamaForCausalLM(nn.Module):
             # compatibility
             if not lora_config else lora_config.lora_vocab_padding_size,
         )
-        self.sampler = Sampler(self.unpadded_vocab_size, config.vocab_size)
+
+        logit_scale = getattr(config, "logit_scale", 1.0)
+        self.logits_processor = LogitsProcessor(self.unpadded_vocab_size,
+                                                config.vocab_size, logit_scale)
+        self.sampler = Sampler()
 
     def forward(
         self,
         input_ids: torch.Tensor,
         positions: torch.Tensor,
-        kv_caches: List[KVCache],
-        input_metadata: InputMetadata,
+        kv_caches: List[torch.Tensor],
+        attn_metadata: AttentionMetadata,
     ) -> torch.Tensor:
         hidden_states = self.model(input_ids, positions, kv_caches,
-                                   input_metadata)
+                                   attn_metadata)
         return hidden_states
+
+    def compute_logits(self, hidden_states: torch.Tensor,
+                       sampling_metadata: SamplingMetadata) -> torch.Tensor:
+        logits = self.logits_processor(self.lm_head.weight, hidden_states,
+                                       sampling_metadata)
+        return logits
 
     def sample(
         self,
-        hidden_states: torch.Tensor,
+        logits: torch.Tensor,
         sampling_metadata: SamplingMetadata,
     ) -> Optional[SamplerOutput]:
-        next_tokens = self.sampler(self.lm_head.weight, hidden_states,
-                                   sampling_metadata)
+        next_tokens = self.sampler(logits, sampling_metadata)
         return next_tokens
 
-    def load_weights(self,
-                     model_name_or_path: str,
-                     cache_dir: Optional[str] = None,
-                     load_format: str = "auto",
-                     revision: Optional[str] = None):
+    def load_weights(self, weights: Iterable[Tuple[str, torch.Tensor]]):
         stacked_params_mapping = [
             # (param_name, shard_name, shard_id)
             ("qkv_proj", "q_proj", "q"),
@@ -417,8 +385,7 @@ class LlamaForCausalLM(nn.Module):
             ("gate_up_proj", "up_proj", 1),
         ]
         params_dict = dict(self.named_parameters())
-        for name, loaded_weight in hf_model_weights_iterator(
-                model_name_or_path, cache_dir, load_format, revision):
+        for name, loaded_weight in weights:
             if "rotary_emb.inv_freq" in name:
                 continue
             if ("rotary_emb.cos_cached" in name
@@ -445,3 +412,27 @@ class LlamaForCausalLM(nn.Module):
                 weight_loader = getattr(param, "weight_loader",
                                         default_weight_loader)
                 weight_loader(param, loaded_weight)
+
+    # If this function is called, it should always initialize KV cache scale
+    # factors (or else raise an exception). Thus, handled exceptions should
+    # make sure to leave KV cache scale factors in a known good (dummy) state
+    def load_kv_cache_scales(self, quantization_param_path: str) -> None:
+        tp_size = get_tensor_model_parallel_world_size()
+        tp_rank = get_tensor_model_parallel_rank()
+        for layer_idx, scaling_factor in kv_cache_scales_loader(
+                quantization_param_path, tp_rank, tp_size,
+                self.config.num_hidden_layers,
+                self.config.__class__.model_type):
+            layer_self_attn = self.model.layers[layer_idx].self_attn
+
+            if is_hip():
+                # The scaling factor convention we are assuming is
+                # quantized_value * scaling_factor ~= true_value
+                # which is consistent with the practice of setting
+                # scaling_factor = tensor_amax / FPtype_max
+                scaling_factor *= 2
+            if hasattr(layer_self_attn, "kv_scale"):
+                layer_self_attn.kv_scale = scaling_factor
+            else:
+                raise RuntimeError("Self attention has no KV cache scaling "
+                                   "factor attribute!")

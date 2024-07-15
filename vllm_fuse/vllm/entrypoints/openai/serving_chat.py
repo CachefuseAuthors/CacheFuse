@@ -1,19 +1,21 @@
-import time
 import codecs
+import time
+from typing import AsyncGenerator, AsyncIterator, List, Optional, Union
+
 from fastapi import Request
-from typing import AsyncGenerator, AsyncIterator, Optional, List, Union
-from vllm.logger import init_logger
-from vllm.utils import random_uuid
+
 from vllm.engine.async_llm_engine import AsyncLLMEngine
 from vllm.entrypoints.openai.protocol import (
     ChatCompletionRequest, ChatCompletionResponse,
     ChatCompletionResponseChoice, ChatCompletionResponseStreamChoice,
     ChatCompletionStreamResponse, ChatMessage, DeltaMessage, ErrorResponse,
     UsageInfo)
-from vllm.outputs import RequestOutput
-from vllm.entrypoints.openai.serving_engine import OpenAIServing, LoRA
+from vllm.entrypoints.openai.serving_engine import LoRA, OpenAIServing
+from vllm.logger import init_logger
 from vllm.model_executor.guided_decoding import (
     get_guided_decoding_logits_processor)
+from vllm.outputs import RequestOutput
+from vllm.utils import random_uuid
 
 logger = init_logger(__name__)
 
@@ -22,12 +24,12 @@ class OpenAIServingChat(OpenAIServing):
 
     def __init__(self,
                  engine: AsyncLLMEngine,
-                 served_model: str,
+                 served_model_names: List[str],
                  response_role: str,
                  lora_modules: Optional[List[LoRA]] = None,
                  chat_template=None):
         super().__init__(engine=engine,
-                         served_model=served_model,
+                         served_model_names=served_model_names,
                          lora_modules=lora_modules)
         self.response_role = response_role
         self._load_chat_template(chat_template)
@@ -61,13 +63,18 @@ class OpenAIServingChat(OpenAIServing):
 
         request_id = f"cmpl-{random_uuid()}"
         try:
-            token_ids = self._validate_prompt_and_tokenize(request,
-                                                           prompt=prompt)
+            # Tokenize/detokenize depending on prompt format (string/token list)
+            prompt_ids, prompt_text = self._validate_prompt_and_tokenize(
+                request, prompt=prompt)
             sampling_params = request.to_sampling_params()
             lora_request = self._maybe_get_lora(request)
+            decoding_config = self.engine.engine.decoding_config
+            guided_decoding_backend = request.guided_decoding_backend \
+                or decoding_config.guided_decoding_backend
             guided_decode_logits_processor = (
                 await get_guided_decoding_logits_processor(
-                    request, await self.engine.get_tokenizer()))
+                    guided_decoding_backend, request, await
+                    self.engine.get_tokenizer()))
             if guided_decode_logits_processor:
                 if sampling_params.logits_processors is None:
                     sampling_params.logits_processors = []
@@ -76,8 +83,8 @@ class OpenAIServingChat(OpenAIServing):
         except ValueError as e:
             return self.create_error_response(str(e))
 
-        result_generator = self.engine.generate(prompt, sampling_params,
-                                                request_id, token_ids,
+        result_generator = self.engine.generate(prompt_text, sampling_params,
+                                                request_id, prompt_ids,
                                                 lora_request)
         # Streaming response
         if request.stream:
@@ -102,18 +109,18 @@ class OpenAIServingChat(OpenAIServing):
             result_generator: AsyncIterator[RequestOutput], request_id: str
     ) -> Union[ErrorResponse, AsyncGenerator[str, None]]:
 
-        model_name = request.model
-        created_time = int(time.monotonic())
+        model_name = self.served_model_names[0]
+        created_time = int(time.time())
         chunk_object_type = "chat.completion.chunk"
         first_iteration = True
 
         # Send response for each token for each request.n (index)
+        assert request.n is not None
         previous_texts = [""] * request.n
         previous_num_tokens = [0] * request.n
         finish_reason_sent = [False] * request.n
         try:
             async for res in result_generator:
-                res: RequestOutput
                 # We need to do it here, because if there are exceptions in
                 # the result_generator, it needs to be sent as the FIRST
                 # response (by the try...catch).
@@ -218,7 +225,8 @@ class OpenAIServingChat(OpenAIServing):
                             index=i,
                             delta=DeltaMessage(content=delta_text),
                             logprobs=logprobs,
-                            finish_reason=output.finish_reason)
+                            finish_reason=output.finish_reason,
+                            stop_reason=output.stop_reason)
                         chunk = ChatCompletionStreamResponse(
                             id=request_id,
                             object=chunk_object_type,
@@ -243,8 +251,8 @@ class OpenAIServingChat(OpenAIServing):
             result_generator: AsyncIterator[RequestOutput],
             request_id: str) -> Union[ErrorResponse, ChatCompletionResponse]:
 
-        model_name = request.model
-        created_time = int(time.monotonic())
+        model_name = self.served_model_names[0]
+        created_time = int(time.time())
         final_res: RequestOutput = None
 
         async for res in result_generator:
@@ -276,6 +284,7 @@ class OpenAIServingChat(OpenAIServing):
                 message=ChatMessage(role=role, content=output.text),
                 logprobs=logprobs,
                 finish_reason=output.finish_reason,
+                stop_reason=output.stop_reason,
             )
             choices.append(choice_data)
 
@@ -310,23 +319,30 @@ class OpenAIServingChat(OpenAIServing):
         return response
 
     def _load_chat_template(self, chat_template):
+        tokenizer = self.tokenizer
+
         if chat_template is not None:
             try:
                 with open(chat_template, "r") as f:
-                    self.tokenizer.chat_template = f.read()
-            except OSError:
+                    tokenizer.chat_template = f.read()
+            except OSError as e:
+                JINJA_CHARS = "{}\n"
+                if not any(c in chat_template for c in JINJA_CHARS):
+                    msg = (f"The supplied chat template ({chat_template}) "
+                           f"looks like a file path, but it failed to be "
+                           f"opened. Reason: {e}")
+                    raise ValueError(msg) from e
+
                 # If opening a file fails, set chat template to be args to
                 # ensure we decode so our escape are interpreted correctly
-                self.tokenizer.chat_template = codecs.decode(
+                tokenizer.chat_template = codecs.decode(
                     chat_template, "unicode_escape")
 
             logger.info(
-                f"Using supplied chat template:\n{self.tokenizer.chat_template}"
-            )
-        elif self.tokenizer.chat_template is not None:
+                f"Using supplied chat template:\n{tokenizer.chat_template}")
+        elif tokenizer.chat_template is not None:
             logger.info(
-                f"Using default chat template:\n{self.tokenizer.chat_template}"
-            )
+                f"Using default chat template:\n{tokenizer.chat_template}")
         else:
             logger.warning(
                 "No chat template provided. Chat API will not work.")

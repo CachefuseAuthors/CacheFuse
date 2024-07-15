@@ -6,27 +6,15 @@ This is an anonymous code repo for [You Only Prefill Once: Fusing Cached Knowled
 To install CacheFuse depenencies
 ```
 git clone git@github.com:CachefuseAuthors/CacheFuse.git
-cd CacheFuse
+cd CacheFuse/vllm_fuse
 pip install -e .
+cd ..
 ```
 
 
 ## Example run
-### Run LLM inference with CacheFuse
-Step 1: To independently generate the KV caches for multiple text segments
+### Run LLM inference w./w.o. CacheBlend with a single script
 ```
-python examples/preprocess.py --text_path inputs/1.json --cache_path <PATH OF THE KV CACHE>
-```
-
-
-Step 2: To run LLM inference w/ CacheFuse
-```
-python examples/fuse_gen.py --cache_path <PATH OF THE KV CACHE>
-```
-
-### Run normal LLM inference
-To run LLM inference w/o CacheFuse
-```
-python examples/normal_gen.py
+python example/blend.py
 ```
 ## References
